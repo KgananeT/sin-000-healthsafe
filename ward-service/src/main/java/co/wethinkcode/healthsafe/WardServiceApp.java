@@ -7,7 +7,10 @@ import io.javalin.http.HttpStatus;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
 import javax.jms.Connection;
+import javax.jms.DeliveryMode;
 import javax.jms.MessageConsumer;
+import javax.jms.MessageProducer;
+import javax.jms.Queue;
 import javax.jms.Session;
 import javax.jms.TextMessage;
 import javax.jms.Topic;
@@ -15,6 +18,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,9 +35,14 @@ public class WardServiceApp {
     // via the staffing-events-topic subscription - no polling of staffing-service.
     private static final Map<String, Map<String, Object>> staffingByWardId = new ConcurrentHashMap<>();
 
+    // MQ: queue producer for equipment-failure-queue, set up once and reused.
+    private static Session equipmentQueueSession;
+    private static MessageProducer equipmentQueueProducer;
+
     public static void main(String[] args) {
         loadWardsFromIngestion();
         subscribeToStaffingEvents();
+        setUpEquipmentFailureProducer();
 
         Javalin app = Javalin.create().start(7031);
 
@@ -63,6 +72,35 @@ public class WardServiceApp {
             } else {
                 ctx.json(event);
             }
+        });
+
+        // POST /wards/{id}/equipment-failure -> reports a failure, publishes it to equipment-failure-queue
+        app.post("/wards/{id}/equipment-failure", ctx -> {
+            String id = ctx.pathParam("id").trim().toUpperCase();
+            WardRecord ward = wardsById.get(id);
+            if (ward == null) {
+                ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "no ward found for id " + id));
+                return;
+            }
+
+            EquipmentFailureReport report = ctx.bodyAsClass(EquipmentFailureReport.class);
+            String issue = (report.issue == null || report.issue.isBlank()) ? "unspecified failure" : report.issue;
+
+            Map<String, Object> alert = Map.of(
+                    "wardId", ward.wardId,
+                    "department", ward.department,
+                    "issue", issue,
+                    "reportedAt", Instant.now().toString()
+            );
+
+            boolean published = publishEquipmentFailure(alert);
+            if (!published) {
+                ctx.status(HttpStatus.SERVICE_UNAVAILABLE)
+                        .json(Map.of("error", "could not publish alert - broker unavailable"));
+                return;
+            }
+
+            ctx.status(HttpStatus.ACCEPTED).json(alert);
         });
     }
 
@@ -140,6 +178,41 @@ public class WardServiceApp {
         }
     }
 
+    /** Sets up a long-lived JMS connection/session/producer for equipment-failure-queue. */
+    private static void setUpEquipmentFailureProducer() {
+        try {
+            ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(MqConfig.BROKER_URL);
+            Connection connection = factory.createConnection();
+            connection.start();
+            equipmentQueueSession = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Queue queue = equipmentQueueSession.createQueue(MqConfig.QUEUE);
+            equipmentQueueProducer = equipmentQueueSession.createProducer(queue);
+            // Explicit PERSISTENT delivery: this is the whole point of using a queue here -
+            // an equipment failure alert must survive a broker restart, unlike a staffing
+            // broadcast which is fine to lose if nobody's listening at that instant.
+            equipmentQueueProducer.setDeliveryMode(DeliveryMode.PERSISTENT);
+            System.out.println("Connected to broker at " + MqConfig.BROKER_URL + ", publishing to " + MqConfig.QUEUE);
+        } catch (Exception e) {
+            System.err.println("WARNING: could not connect to broker (" + e.getMessage() + "). Equipment failure alerts will not be published.");
+        }
+    }
+
+    /** Publishes an equipment failure alert. Returns false if the broker isn't available. */
+    private static boolean publishEquipmentFailure(Map<String, Object> alert) {
+        if (equipmentQueueProducer == null) {
+            return false;
+        }
+        try {
+            String json = MAPPER.writeValueAsString(alert);
+            TextMessage message = equipmentQueueSession.createTextMessage(json);
+            equipmentQueueProducer.send(message);
+            return true;
+        } catch (Exception e) {
+            System.err.println("WARNING: failed to publish equipment failure alert: " + e.getMessage());
+            return false;
+        }
+    }
+
     /** Mirrors the shape produced by ingestion-service's /wards endpoint. */
     static class WardRecord {
         public String wardId;
@@ -150,6 +223,14 @@ public class WardServiceApp {
 
         public WardRecord() {
             // needed for Jackson deserialization
+        }
+    }
+
+    /** Request body for POST /wards/{id}/equipment-failure. */
+    static class EquipmentFailureReport {
+        public String issue;
+
+        public EquipmentFailureReport() {
         }
     }
 }
